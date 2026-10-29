@@ -40,11 +40,13 @@ Or run directly from GitHub without cloning:
 ## Tools
 
 ### `get_repo_map`
-Returns a PageRank-ranked code skeleton fitting within `max_map_tokens`.
+Returns a PageRank-ranked code skeleton fitting within `max_map_tokens`, prefixed with coverage telemetry.
 
-- `root_path` (string, default: `"."`): Repository directory (auto-climbs to nearest `.git`).
+- `root_path` (string, default: `"."`): Target directory (scopes candidate files; `"."` maps entire repo).
+- `include_tests` (bool, default: `false`): Include unit tests and `tests/` directories.
+- `types_only` (bool, default: `false`): Filter to type definitions (structs, classes, interfaces, enums).
 - `focus_files` (list[string]): Currently active/edited files to bias PageRank towards.
-- `other_files` (list[string]): Files to include. Defaults to git-tracked files.
+- `other_files` (list[string]): Explicit file list. Defaults to scoped discovered files.
 - `mentioned_idents` (list[string]): Symbol names to prioritize.
 - `max_map_tokens` (int, default: `2048`): Max token budget.
 - `force_refresh` (bool, default: `false`): Invalidate tag cache.
@@ -53,7 +55,7 @@ Returns a PageRank-ranked code skeleton fitting within `max_map_tokens`.
 Extracts Tree-sitter definitions and references for a specific file.
 
 - `file_path` (string): Target source file.
-- `root_path` (string, default: `"."`): Repository directory.
+- `root_path` (string, default: `"."`): Repository or target directory.
 
 ## Cache
 

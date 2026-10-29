@@ -10,7 +10,7 @@ import anyio
 import pytest
 
 from repomap_mcp.repomap import RepoMap, compute_pagerank
-from repomap_mcp.server import get_tags, mcp
+from repomap_mcp.server import get_repo_map, get_tags, mcp
 from repomap_mcp.utils import count_tokens, find_git_root, get_repo_files
 
 
@@ -88,7 +88,7 @@ def test_repomap_generation(tmp_path: Path):
         other_files=["app.py", "models.py"],
         max_map_tokens=20,
     )
-    assert count_tokens(small_map) <= 30
+    assert count_tokens(small_map) <= 75
 
 
 def test_get_tags(tmp_path: Path):
@@ -117,7 +117,7 @@ def test_cache_location_inside_git(tmp_path: Path):
 
 
 def test_cache_fallback_no_git(tmp_path: Path):
-    """Verify non-git directories fall back to ~/.cache/repomap-mcp/tags-<hash>."""
+    """Verify non-git directories fall back to ~/.cache/repomap-mcp/tags-v3-<hash>."""
     import hashlib
 
     no_git_dir = tmp_path / "plain_dir"
@@ -125,7 +125,7 @@ def test_cache_fallback_no_git(tmp_path: Path):
 
     mapper = RepoMap(root=no_git_dir)
     h = hashlib.sha256(str(no_git_dir).encode("utf-8")).hexdigest()[:12]
-    expected_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-{h}"
+    expected_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-v3-{h}"
     assert mapper.cache_dir == expected_cache
     assert expected_cache.exists()
 
@@ -140,6 +140,78 @@ def test_cache_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert custom_cache.exists()
 
 
+def test_subdirectory_scoping(tmp_path: Path):
+    """Verify root_path scopes candidate files to requested folder."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "api.py").write_text("def start_server(): pass\n")
+
+    web_dir = tmp_path / "web"
+    web_dir.mkdir()
+    (web_dir / "app.py").write_text("def render_ui(): pass\n")
+
+    # Scoped to web: only web/app.py should be mapped
+    scoped_out = get_repo_map(root_path=str(web_dir))
+    assert "app.py" in scoped_out
+    assert "api.py" not in scoped_out
+
+    # Scoped to repo root: both mapped
+    all_out = get_repo_map(root_path=str(tmp_path))
+    assert "app.py" in all_out
+    assert "api.py" in all_out
+
+
+def test_telemetry_header(tmp_path: Path):
+    """Verify telemetry JSON header metadata is always present."""
+    (tmp_path / "main.py").write_text("def run(): pass\n")
+
+    out = get_repo_map(root_path=str(tmp_path))
+    assert out.startswith("```json")
+    assert '"total_repo_files":' in out
+    assert '"mapped_files":' in out
+    assert '"dropped_files":' in out
+    assert '"budget_exhausted":' in out
+
+
+def test_prune_test_files(tmp_path: Path):
+    """Verify automatic pruning of tests/ dirs and test files."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "core.py").write_text("def core_logic(): pass\n")
+
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_core.py").write_text("def test_core(): pass\n")
+
+    # Pruned by default
+    pruned = get_repo_map(root_path=str(tmp_path), include_tests=False)
+    assert "core_logic" in pruned
+    assert "test_core" not in pruned
+
+    # Included when requested
+    included = get_repo_map(root_path=str(tmp_path), include_tests=True)
+    assert "core_logic" in included
+    assert "test_core" in included
+
+
+def test_types_only(tmp_path: Path):
+    """Verify types_only filter renders only structs/classes/types, skipping function bodies."""
+    (tmp_path / "models.py").write_text(
+        "class UserModel:\n    id: int\n\n\n\n\ndef helper_func():\n    pass\n"
+    )
+
+    all_out = get_repo_map(root_path=str(tmp_path), types_only=False)
+    assert "UserModel" in all_out
+    assert "helper_func" in all_out
+
+    types_out = get_repo_map(root_path=str(tmp_path), types_only=True)
+    assert "UserModel" in types_out
+    assert "helper_func" not in types_out
+
+
 def test_mcp_tools_registered():
     """Verify MCP tools are registered with valid input schemas."""
     tools = anyio.run(mcp.list_tools)
@@ -150,7 +222,6 @@ def test_mcp_tools_registered():
 
 def test_stdio_jsonrpc_handshake_and_tool_call(tmp_path: Path):
     """End-to-end test verifying full JSON-RPC over stdio subprocess."""
-    # Create test python file in temp dir
     test_file = tmp_path / "calc.py"
     test_file.write_text(
         "def add(a, b):\n    return a + b\n",
@@ -207,7 +278,10 @@ def test_stdio_jsonrpc_handshake_and_tool_call(tmp_path: Path):
                 "method": "tools/call",
                 "params": {
                     "name": "get_repo_map",
-                    "arguments": {"root_path": str(tmp_path), "max_map_tokens": 500},
+                    "arguments": {
+                        "root_path": str(tmp_path),
+                        "max_map_tokens": 500,
+                    },
                 },
             }
         )

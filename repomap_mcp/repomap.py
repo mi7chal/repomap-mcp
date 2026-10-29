@@ -11,9 +11,11 @@
 # Modified for repomap-mcp.
 
 import hashlib
+import json
 import os
 import sys
-from collections import defaultdict, namedtuple
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import grep_ast
@@ -24,9 +26,21 @@ import tree_sitter_language_pack as tslp
 from diskcache import Cache
 from pygments.lexers import guess_lexer_for_filename
 
-from .utils import count_tokens, find_git_root, get_repo_files
+from .utils import (
+    count_tokens,
+    find_git_root,
+    get_repo_files,
+)
 
-Tag = namedtuple("Tag", ["rel_fname", "fname", "line", "name", "kind"])
+
+@dataclass
+class Tag:
+    rel_fname: str
+    fname: str
+    line: int
+    name: str
+    kind: str  # "def" | "ref"
+    symbol_type: str = "other"  # "class", "struct", "interface", "enum", "type", "func"
 
 
 def compute_pagerank(
@@ -58,44 +72,55 @@ def compute_pagerank(
         dangling_contrib = damping * dangling_sum
 
         for n in nodes:
-            in_sum = sum(ranks[pred] / out_degree[pred] for pred in graph.predecessors(n))
+            incoming_sum = 0.0
+            for pred in graph.predecessors(n):
+                k = graph.number_of_edges(pred, n)
+                deg = out_degree[pred]
+                if deg > 0:
+                    incoming_sum += ranks[pred] * (k / deg)
             new_ranks[n] = (
-                (1.0 - damping) * p_weights[n] + dangling_contrib * p_weights[n] + damping * in_sum
+                damping * incoming_sum
+                + dangling_contrib * p_weights[n]
+                + (1.0 - damping) * p_weights[n]
             )
 
         err = sum(abs(new_ranks[n] - ranks[n]) for n in nodes)
         ranks = new_ranks
         if err < tol:
             break
-    return ranks
+
+    total = sum(ranks.values()) or 1.0
+    return {n: r / total for n, r in ranks.items()}
 
 
 class RepoMap:
     def __init__(
         self,
         root: str | Path | None = None,
+        target_dir: str | Path | None = None,
         max_map_tokens: int = 2048,
         verbose: bool = False,
     ):
         self.root = Path(find_git_root(root)).resolve()
+        self.target_dir = Path(target_dir).resolve() if target_dir is not None else self.root
         self.max_map_tokens = max_map_tokens
         self.verbose = verbose
         self.cache, self.cache_dir = self._init_cache()
         self._queries_cache: dict[str, str | None] = {}
 
     def _init_cache(self) -> tuple[Cache, Path]:
-        custom_cache = os.environ.get("REPOMAP_CACHE_DIR")
-        if custom_cache:
-            cache_path = Path(custom_cache)
-            cache_path.mkdir(parents=True, exist_ok=True)
-            return Cache(str(cache_path)), cache_path
+        override = os.environ.get("REPOMAP_CACHE_DIR")
+        if override:
+            p = Path(override).expanduser().resolve()
+            p.mkdir(parents=True, exist_ok=True)
+            return Cache(str(p)), p
 
         git_dir = self.root / ".git"
         if git_dir.is_dir():
             repo_cache = git_dir / "repomap-mcp" / "cache"
             try:
                 repo_cache.mkdir(parents=True, exist_ok=True)
-                test_file = repo_cache / ".write_test"
+                test_file = repo_cache / ".perm_check"
                 test_file.touch()
                 test_file.unlink()
                 return Cache(str(repo_cache)), repo_cache
@@ -103,7 +128,7 @@ class RepoMap:
                 pass
 
         h = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:12]
-        user_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-{h}"
+        user_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-v3-{h}"
         user_cache.mkdir(parents=True, exist_ok=True)
         return Cache(str(user_cache)), user_cache
 
@@ -142,7 +167,7 @@ class RepoMap:
         except OSError:
             return []
 
-        cache_key = (rel_fname, mtime)
+        cache_key = ("v3", rel_fname, mtime)
         if cache_key in self.cache:
             return self.cache[cache_key]
 
@@ -182,16 +207,33 @@ class RepoMap:
                         )
                         line = name_node.start_point[0] + 1
 
-                        if name and name.isidentifier():
-                            tags.append(
-                                Tag(
-                                    rel_fname=rel_fname,
-                                    fname=fname,
-                                    line=line,
-                                    name=name,
-                                    kind=kind,
-                                )
+                        if not name or not name.isidentifier():
+                            continue
+
+                        symbol_type = "other"
+                        if "class" in kind_str:
+                            symbol_type = "class"
+                        elif "struct" in kind_str:
+                            symbol_type = "struct"
+                        elif "interface" in kind_str:
+                            symbol_type = "interface"
+                        elif "enum" in kind_str:
+                            symbol_type = "enum"
+                        elif "type" in kind_str:
+                            symbol_type = "type"
+                        elif "method" in kind_str or "function" in kind_str:
+                            symbol_type = "func"
+
+                        tags.append(
+                            Tag(
+                                rel_fname=rel_fname,
+                                fname=fname,
+                                line=line,
+                                name=name,
+                                kind=kind,
+                                symbol_type=symbol_type,
                             )
+                        )
             except Exception as e:
                 self.log(f"Tree-sitter parse error on {rel_fname}: {e}")
 
@@ -205,6 +247,7 @@ class RepoMap:
                     lines_in_val = val.count("\n")
                     clean_name = val.strip()
                     if clean_name.isidentifier():
+                        sym_type = "class" if str(token_type) == "Token.Name.Class" else "func"
                         if str(token_type) in ("Token.Name.Class", "Token.Name.Function"):
                             tags.append(
                                 Tag(
@@ -213,6 +256,7 @@ class RepoMap:
                                     line=cur_line,
                                     name=clean_name,
                                     kind="def",
+                                    symbol_type=sym_type,
                                 )
                             )
                         elif str(token_type).startswith("Token.Name"):
@@ -285,14 +329,29 @@ class RepoMap:
 
         return ranks, file_tags
 
-    def render_tree(self, rel_fname: str, tags: list[Tag]) -> str | None:
+    def render_tree(
+        self,
+        rel_fname: str,
+        tags: list[Tag],
+        types_only: bool = False,
+    ) -> str | None:
         full_path = self.root / rel_fname
         try:
             code = full_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
 
-        lines_of_interest = [t.line for t in tags if t.kind == "def"] or [1]
+        if types_only:
+            lines_of_interest = [
+                t.line
+                for t in tags
+                if t.kind == "def"
+                and t.symbol_type in ("class", "struct", "interface", "enum", "type")
+            ]
+            if not lines_of_interest:
+                return None
+        else:
+            lines_of_interest = [t.line for t in tags if t.kind == "def"] or [1]
 
         try:
             tc = grep_ast.TreeContext(
@@ -301,6 +360,8 @@ class RepoMap:
                 color=False,
                 line_number=False,
                 mark_lois=False,
+                last_line=False,
+                margin=0 if types_only else 3,
             )
             tc.add_lines_of_interest(lines_of_interest)
             tc.add_context()
@@ -320,6 +381,8 @@ class RepoMap:
         other_files: list[str] | None = None,
         mentioned_idents: list[str] | None = None,
         max_map_tokens: int | None = None,
+        include_tests: bool = False,
+        types_only: bool = False,
         force_refresh: bool = False,
     ) -> str:
         if force_refresh:
@@ -329,7 +392,15 @@ class RepoMap:
         if max_tokens <= 0:
             return ""
 
-        all_files = list(other_files) if other_files is not None else get_repo_files(self.root)
+        if other_files is not None:
+            all_files = list(other_files)
+        else:
+            all_files = get_repo_files(
+                self.root,
+                target_dir=self.target_dir,
+                include_tests=include_tests,
+            )
+
         if not all_files:
             return "No files found in repository."
 
@@ -341,37 +412,40 @@ class RepoMap:
 
         rendered_cache = {}
         for f in ranked_files:
-            rendered = self.render_tree(f, file_tags.get(f, []))
+            rendered = self.render_tree(f, file_tags.get(f, []), types_only=types_only)
             if rendered:
                 rendered_cache[f] = rendered
 
-        # Fast path: check if everything fits
-        full_output = "\n".join(rendered_cache[f] for f in ranked_files if f in rendered_cache)
+        valid_ranked_files = [f for f in ranked_files if f in rendered_cache]
+        if not valid_ranked_files:
+            return "No relevant symbols found matching criteria."
+
+        full_output = "\n".join(rendered_cache[f] for f in valid_ranked_files)
+        mapped_files: list[str] = []
+
         if count_tokens(full_output) <= max_tokens:
-            return full_output.strip()
+            best_output = full_output.strip()
+            mapped_files = valid_ranked_files
+        else:
+            low = 1
+            high = len(valid_ranked_files)
+            best_output = ""
 
-        # Binary search for optimal file subset within token budget
-        low = 1
-        high = len(ranked_files)
-        best_output = ""
+            while low <= high:
+                mid = (low + high) // 2
+                candidate_files = valid_ranked_files[:mid]
+                candidate_output = "\n".join(rendered_cache[f] for f in candidate_files)
+                cand_tokens = count_tokens(candidate_output)
 
-        while low <= high:
-            mid = (low + high) // 2
-            candidate_files = ranked_files[:mid]
-            candidate_output = "\n".join(
-                rendered_cache[f] for f in candidate_files if f in rendered_cache
-            )
-            cand_tokens = count_tokens(candidate_output)
+                if cand_tokens <= max_tokens:
+                    best_output = candidate_output
+                    mapped_files = candidate_files
+                    low = mid + 1
+                else:
+                    high = mid - 1
 
-            if cand_tokens <= max_tokens:
-                best_output = candidate_output
-                low = mid + 1
-            else:
-                high = mid - 1
-
-        if not best_output and ranked_files:
-            first = ranked_files[0]
-            if first in rendered_cache:
+            if not best_output and valid_ranked_files:
+                first = valid_ranked_files[0]
                 lines = rendered_cache[first].splitlines()
                 truncated = []
                 for line in lines:
@@ -380,5 +454,13 @@ class RepoMap:
                         truncated.pop()
                         break
                 best_output = "\n".join(truncated)
+                mapped_files = [first]
 
-        return best_output.strip()
+        telemetry = {
+            "total_repo_files": len(all_files),
+            "mapped_files": len(mapped_files),
+            "dropped_files": len(all_files) - len(mapped_files),
+            "budget_exhausted": len(all_files) > len(mapped_files),
+        }
+        header = f"```json\n{json.dumps(telemetry, indent=2)}\n```\n\n"
+        return header + best_output.strip()
