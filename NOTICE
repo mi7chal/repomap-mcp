@@ -1,0 +1,11 @@
+repomap-mcp
+Copyright 2026 RepoMap MCP Contributors
+
+This product includes software and Tree-sitter query patterns derived from
+Aider (https://github.com/Aider-AI/aider), developed by Paul Gauthier and
+licensed under the Apache License, Version 2.0.
+
+========================================================================
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+Copyright (c) Paul Gauthier
+========================================================================

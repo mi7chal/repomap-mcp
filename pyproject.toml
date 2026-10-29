@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "repomap-mcp"
+version = "0.1.0"
+description = "Local stdio Model Context Protocol (MCP) server for repository mapping"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "RepoMap MCP Contributors" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "grep-ast>=0.4.0",
+    "tree-sitter>=0.20.0",
+    "tree-sitter-language-pack>=0.2.0",
+    "networkx>=3.0",
+    "diskcache>=5.6.0",
+    "tiktoken>=0.7.0",
+    "pygments>=2.14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+    "prek>=0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mi7chal/repomap-mcp"
+Repository = "https://github.com/mi7chal/repomap-mcp.git"
+Issues = "https://github.com/mi7chal/repomap-mcp/issues"
+
+[project.scripts]
+repomap-mcp = "repomap_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["repomap_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
