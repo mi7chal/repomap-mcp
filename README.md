@@ -50,7 +50,7 @@ Returns a PageRank-ranked code skeleton fitting within `max_map_tokens`, prefixe
 - `mentioned_idents` (list[string]): Symbol names to prioritize.
 - `max_map_tokens` (int, default: `2048`): Max token budget.
 - `force_refresh` (bool, default: `false`): Invalidate tag cache.
-
+- `auto_focus_git` (bool, default: `true`): Automatically detect and bias ranking towards git modified/untracked files.
 ### `get_tags`
 Extracts Tree-sitter definitions and references for a specific file.
 

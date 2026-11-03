@@ -29,6 +29,7 @@ from pygments.lexers import guess_lexer_for_filename
 from .utils import (
     count_tokens,
     find_git_root,
+    get_git_modified_files,
     get_repo_files,
 )
 
@@ -334,6 +335,8 @@ class RepoMap:
         rel_fname: str,
         tags: list[Tag],
         types_only: bool = False,
+        lines_of_interest: list[int] | None = None,
+        margin: int | None = None,
     ) -> str | None:
         full_path = self.root / rel_fname
         try:
@@ -341,17 +344,24 @@ class RepoMap:
         except OSError:
             return None
 
-        if types_only:
-            lines_of_interest = [
+        if lines_of_interest is not None:
+            lois = sorted(set(lines_of_interest))
+            if not lois and types_only:
+                return None
+        elif types_only:
+            lois = [
                 t.line
                 for t in tags
                 if t.kind == "def"
                 and t.symbol_type in ("class", "struct", "interface", "enum", "type")
             ]
-            if not lines_of_interest:
+            if not lois:
                 return None
         else:
-            lines_of_interest = [t.line for t in tags if t.kind == "def"] or [1]
+            lois = [t.line for t in tags if t.kind == "def"] or [1]
+
+        if margin is None:
+            margin = 0 if types_only else 3
 
         try:
             tc = grep_ast.TreeContext(
@@ -361,9 +371,12 @@ class RepoMap:
                 line_number=False,
                 mark_lois=False,
                 last_line=False,
-                margin=0 if types_only else 3,
+                margin=margin,
+                child_context=margin > 0,
+                loi_pad=1 if margin > 0 else 0,
             )
-            tc.add_lines_of_interest(lines_of_interest)
+            tc_lois = set(lois) | {max(0, line_no - 1) for line_no in lois}
+            tc.add_lines_of_interest(tc_lois)
             tc.add_context()
             formatted = tc.format()
             if formatted:
@@ -384,6 +397,7 @@ class RepoMap:
         include_tests: bool = False,
         types_only: bool = False,
         force_refresh: bool = False,
+        auto_focus_git: bool = True,
     ) -> str:
         if force_refresh:
             self.cache.clear()
@@ -405,48 +419,131 @@ class RepoMap:
             return "No files found in repository."
 
         chat_set = set(focus_files or [])
+        if auto_focus_git:
+            git_modified = get_git_modified_files(self.root)
+            all_files_set = set(all_files)
+            for gm in git_modified:
+                if gm in all_files_set or other_files is None:
+                    chat_set.add(gm)
+
         ident_set = set(mentioned_idents or [])
 
         ranks, file_tags = self.build_graph(all_files, chat_set, ident_set)
         ranked_files = sorted(all_files, key=lambda f: ranks.get(f, 0.0), reverse=True)
 
-        rendered_cache = {}
+        # Group candidate definition tags
+        candidate_tags_by_file: dict[str, list[Tag]] = {}
         for f in ranked_files:
-            rendered = self.render_tree(f, file_tags.get(f, []), types_only=types_only)
-            if rendered:
-                rendered_cache[f] = rendered
+            tags = file_tags.get(f, [])
+            if types_only:
+                c_tags = [
+                    t
+                    for t in tags
+                    if t.kind == "def"
+                    and t.symbol_type in ("class", "struct", "interface", "enum", "type")
+                ]
+            else:
+                c_tags = [t for t in tags if t.kind == "def"]
+            candidate_tags_by_file[f] = c_tags
 
-        valid_ranked_files = [f for f in ranked_files if f in rendered_cache]
+        def get_tag_priority(t: Tag) -> float:
+            base = ranks.get(t.rel_fname, 0.0)
+            if t.rel_fname in chat_set:
+                base += 50.0
+            if ident_set and t.name in ident_set:
+                base += 20.0
+            multiplier = 1.0
+            if t.symbol_type in ("class", "struct", "interface", "enum", "type"):
+                multiplier = 3.0
+            elif t.symbol_type == "func":
+                multiplier = 1.5
+            return base * multiplier
+
+        all_ranked_tags = [tag for f in ranked_files for tag in candidate_tags_by_file.get(f, [])]
+        all_ranked_tags.sort(key=get_tag_priority, reverse=True)
+
+        # Tier 1: Render full context (margin=3) with all candidate tags
+        full_renders: dict[str, str] = {}
+        for f in ranked_files:
+            rendered = self.render_tree(
+                f,
+                candidate_tags_by_file[f],
+                types_only=types_only,
+                margin=0 if types_only else 3,
+            )
+            if rendered:
+                full_renders[f] = rendered
+
+        valid_ranked_files = [f for f in ranked_files if f in full_renders]
         if not valid_ranked_files:
             return "No relevant symbols found matching criteria."
 
-        full_output = "\n".join(rendered_cache[f] for f in valid_ranked_files)
+        full_output = "\n".join(full_renders[f] for f in valid_ranked_files)
         mapped_files: list[str] = []
+        best_output = ""
 
         if count_tokens(full_output) <= max_tokens:
             best_output = full_output.strip()
             mapped_files = valid_ranked_files
         else:
-            low = 1
-            high = len(valid_ranked_files)
-            best_output = ""
+            # Tier 2: Try compact context (margin=0) with all candidate tags
+            compact_renders: dict[str, str] = {}
+            for f in valid_ranked_files:
+                rendered = self.render_tree(
+                    f,
+                    candidate_tags_by_file[f],
+                    types_only=types_only,
+                    margin=0,
+                )
+                if rendered:
+                    compact_renders[f] = rendered
 
-            while low <= high:
-                mid = (low + high) // 2
-                candidate_files = valid_ranked_files[:mid]
-                candidate_output = "\n".join(rendered_cache[f] for f in candidate_files)
-                cand_tokens = count_tokens(candidate_output)
+            compact_output = "\n".join(
+                compact_renders[f] for f in valid_ranked_files if f in compact_renders
+            )
+            if compact_output and count_tokens(compact_output) <= max_tokens:
+                best_output = compact_output.strip()
+                mapped_files = [f for f in valid_ranked_files if f in compact_renders]
+            elif all_ranked_tags:
+                # Tier 3: Hierarchical symbol pruning via binary search over ranked tags
+                low = 1
+                high = len(all_ranked_tags)
 
-                if cand_tokens <= max_tokens:
-                    best_output = candidate_output
-                    mapped_files = candidate_files
-                    low = mid + 1
-                else:
-                    high = mid - 1
+                while low <= high:
+                    mid = (low + high) // 2
+                    selected_tags = all_ranked_tags[:mid]
+                    lois_by_file: dict[str, list[int]] = defaultdict(list)
+                    for t in selected_tags:
+                        lois_by_file[t.rel_fname].append(t.line)
 
+                    candidate_files = [f for f in valid_ranked_files if f in lois_by_file]
+                    candidate_chunks = []
+                    for f in candidate_files:
+                        r = self.render_tree(
+                            f,
+                            candidate_tags_by_file[f],
+                            types_only=types_only,
+                            lines_of_interest=lois_by_file[f],
+                            margin=0,
+                        )
+                        if r:
+                            candidate_chunks.append(r)
+
+                    cand_output = "\n".join(candidate_chunks)
+                    cand_tokens = count_tokens(cand_output)
+
+                    if cand_tokens <= max_tokens:
+                        best_output = cand_output
+                        mapped_files = candidate_files
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+
+            # Tier 4: Fallback for extremely constrained token budgets
             if not best_output and valid_ranked_files:
                 first = valid_ranked_files[0]
-                lines = rendered_cache[first].splitlines()
+                first_render = full_renders.get(first, "")
+                lines = first_render.splitlines()
                 truncated = []
                 for line in lines:
                     truncated.append(line)

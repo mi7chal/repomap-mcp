@@ -11,7 +11,7 @@ import pytest
 
 from repomap_mcp.repomap import RepoMap, compute_pagerank
 from repomap_mcp.server import get_repo_map, get_tags, mcp
-from repomap_mcp.utils import count_tokens, find_git_root, get_repo_files
+from repomap_mcp.utils import count_tokens, find_git_root, get_git_modified_files, get_repo_files
 
 
 def test_token_counter():
@@ -210,6 +210,51 @@ def test_types_only(tmp_path: Path):
     types_out = get_repo_map(root_path=str(tmp_path), types_only=True)
     assert "UserModel" in types_out
     assert "helper_func" not in types_out
+
+
+def test_git_status_auto_focus(tmp_path: Path):
+    """Verify git status auto-detects modified/untracked files and biases focus."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+
+    f1 = tmp_path / "base.py"
+    f1.write_text("def base_func():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True)
+
+    f2 = tmp_path / "modified.py"
+    f2.write_text("def modified_func():\n    return 2\n", encoding="utf-8")
+
+    mod_files = get_git_modified_files(tmp_path)
+    assert "modified.py" in mod_files
+
+    # RepoMap should automatically focus modified.py
+    mapper = RepoMap(root=tmp_path)
+    out = mapper.get_repo_map(auto_focus_git=True)
+    assert "modified.py" in out
+    assert "modified_func" in out
+
+
+def test_hierarchical_symbol_pruning(tmp_path: Path):
+    """Verify hierarchical symbol pruning retains key classes across files under token limits."""
+    svc_code = ["class PaymentService:"]
+    for i in range(12):
+        svc_code.append(f"    def process_step_{i}(self):\n        val = {i}\n        return val")
+    (tmp_path / "service.py").write_text("\n".join(svc_code), encoding="utf-8")
+
+    cust_code = ["class CustomerEntity:"]
+    for i in range(8):
+        cust_code.append(f"    def get_attr_{i}(self):\n        return {i}")
+    (tmp_path / "customer.py").write_text("\n".join(cust_code), encoding="utf-8")
+
+    mapper = RepoMap(root=tmp_path)
+    # With a constrained token budget, both files should appear with class definitions
+    out = mapper.get_repo_map(max_map_tokens=180)
+    assert "PaymentService" in out
+    assert "CustomerEntity" in out
+    # Confirm telemetry reflects mapped files without completely dropping customer.py
+    assert '"mapped_files": 2' in out
 
 
 def test_mcp_tools_registered():

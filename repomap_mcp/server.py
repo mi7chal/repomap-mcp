@@ -45,6 +45,7 @@ def get_repo_map(
     mentioned_idents: list[str] | None = None,
     max_map_tokens: int = 2048,
     force_refresh: bool = False,
+    auto_focus_git: bool = True,
 ) -> str:
     """Generate an Aider-style token-budgeted repository map with PageRank ranking.
 
@@ -57,7 +58,7 @@ def get_repo_map(
         mentioned_idents: Identifiers mentioned in current prompt to prioritize.
         max_map_tokens: Token budget for the output map.
         force_refresh: Force re-parsing of AST tags.
-
+        auto_focus_git: Automatically detect and bias ranking towards git modified/untracked files. Defaults to True.
     Returns:
         Concise code skeleton highlighting key definitions and call signatures.
     """
@@ -74,6 +75,7 @@ def get_repo_map(
         include_tests=include_tests,
         types_only=types_only,
         force_refresh=force_refresh,
+        auto_focus_git=auto_focus_git,
     )
 
 

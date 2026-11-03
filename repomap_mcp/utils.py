@@ -156,6 +156,48 @@ def is_binary_file(path: Path) -> bool:
         return True
 
 
+def get_git_modified_files(root_path: Path) -> list[str]:
+    """Retrieve modified, staged, or untracked files in the git repository."""
+    root_path = Path(root_path).resolve()
+    git_root = find_git_root(root_path)
+    if not (git_root / ".git").exists():
+        return []
+
+    modified_files = set()
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain", "-uall"],
+            cwd=git_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                status = line[:2]
+                path_part = line[3:].strip()
+                if " -> " in path_part:
+                    path_part = path_part.split(" -> ")[1].strip()
+                if path_part.startswith('"') and path_part.endswith('"'):
+                    path_part = path_part[1:-1]
+                if "D" in status:
+                    continue
+                full_path = git_root / path_part
+                if full_path.is_file() and not is_binary_file(full_path):
+                    try:
+                        rel_path = full_path.relative_to(root_path).as_posix()
+                        modified_files.add(rel_path)
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print(f"Warning: git status failed: {e}", file=sys.stderr)
+
+    return sorted(modified_files)
+
+
 def get_repo_files(
     root_path: Path,
     target_dir: Path | None = None,
