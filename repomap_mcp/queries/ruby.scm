@@ -3,9 +3,11 @@
 ; Copyright (c) Paul Gauthier, licensed under Apache License 2.0.
 ; Modified for repomap-mcp.
 
-(class name: [(constant) (scope_resolution name: (constant) @name)] @name) @definition.class
+(class name: (constant) @name) @definition.class
+(class name: (scope_resolution name: (constant) @name)) @definition.class
 
-(module name: [(constant) (scope_resolution name: (constant) @name)] @name) @definition.module
+(module name: (constant) @name) @definition.module
+(module name: (scope_resolution name: (constant) @name)) @definition.module
 
 (method name: (identifier) @name) @definition.method
 (singleton_method name: (identifier) @name) @definition.method

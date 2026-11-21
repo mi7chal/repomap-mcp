@@ -5,17 +5,17 @@
 
 
 (struct_item
-    name: (type_identifier) @name) @definition.class
+    name: (type_identifier) @name) @definition.struct
 
 (enum_item
-    name: (type_identifier) @name) @definition.class
+    name: (type_identifier) @name) @definition.enum
 
 (union_item
-    name: (type_identifier) @name) @definition.class
+    name: (type_identifier) @name) @definition.struct
 
 
 (type_item
-    name: (type_identifier) @name) @definition.class
+    name: (type_identifier) @name) @definition.type
 
 
 (declaration_list

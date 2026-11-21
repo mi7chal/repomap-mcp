@@ -71,6 +71,8 @@ BINARY_EXTENSIONS = {
     ".wasm",
 }
 
+MAX_FILE_BYTES = 1_000_000
+
 _tokenizer_cache = {}
 
 
@@ -86,9 +88,7 @@ def get_tokenizer(model: str = "gpt-4o") -> tiktoken.Encoding | None:
     return _tokenizer_cache[model]
 
 
-def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    if not text:
-        return 0
+def _encode_tokens(text: str, model: str = "gpt-4o") -> int:
     enc = get_tokenizer(model)
     if enc is not None:
         try:
@@ -96,6 +96,19 @@ def count_tokens(text: str, model: str = "gpt-4o") -> int:
         except Exception:
             pass
     return max(1, len(text) // 4)
+
+
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    if not text:
+        return 0
+    if len(text) > 10_000:
+        lines = text.splitlines(keepends=True)
+        if len(lines) >= 200:
+            step = max(1, len(lines) // 100)
+            sample = "".join(lines[::step])
+            if sample:
+                return max(1, round(_encode_tokens(sample, model) * (len(text) / len(sample))))
+    return _encode_tokens(text, model)
 
 
 TEST_DIR_NAMES = {"test", "tests", "__tests__"}
@@ -146,6 +159,13 @@ def resolve_scope(start_path: str | Path | None = None) -> tuple[Path, Path]:
     return git_root, target_dir
 
 
+def is_too_large(path: Path) -> bool:
+    try:
+        return path.stat().st_size > MAX_FILE_BYTES
+    except OSError:
+        return True
+
+
 def is_binary_file(path: Path) -> bool:
     if path.suffix.lower() in BINARY_EXTENSIONS:
         return True
@@ -154,6 +174,13 @@ def is_binary_file(path: Path) -> bool:
             return b"\x00" in f.read(1024)
     except OSError:
         return True
+
+
+def _is_hidden_path(rel_path: str) -> bool:
+    for idx, part in enumerate(rel_path.split("/")):
+        if part.startswith(".") and not (idx == 0 and part == ".github"):
+            return True
+    return False
 
 
 def get_git_modified_files(root_path: Path) -> list[str]:
@@ -166,27 +193,33 @@ def get_git_modified_files(root_path: Path) -> list[str]:
     modified_files = set()
     try:
         res = subprocess.run(
-            ["git", "status", "--porcelain", "-uall"],
+            ["git", "status", "--porcelain", "-z", "-uall"],
             cwd=git_root,
             capture_output=True,
             text=True,
             check=False,
-            timeout=5,
+            timeout=10,
         )
         if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                if len(line) < 4:
+            entries = res.stdout.split("\0")
+            i = 0
+            while i < len(entries):
+                entry = entries[i]
+                i += 1
+                if len(entry) < 4:
                     continue
-                status = line[:2]
-                path_part = line[3:].strip()
-                if " -> " in path_part:
-                    path_part = path_part.split(" -> ")[1].strip()
-                if path_part.startswith('"') and path_part.endswith('"'):
-                    path_part = path_part[1:-1]
+                status = entry[:2]
+                path_part = entry[3:]
+                if "R" in status or "C" in status:
+                    i += 1
                 if "D" in status:
                     continue
                 full_path = git_root / path_part
-                if full_path.is_file() and not is_binary_file(full_path):
+                if (
+                    full_path.is_file()
+                    and not is_too_large(full_path)
+                    and not is_binary_file(full_path)
+                ):
                     try:
                         rel_path = full_path.relative_to(root_path).as_posix()
                         modified_files.add(rel_path)
@@ -224,24 +257,28 @@ def get_repo_files(
 
     if (root_path / ".git").exists():
         try:
+            git_ok = True
             for args in (
-                ["git", "ls-files"],
-                ["git", "ls-files", "--others", "--exclude-standard"],
+                ["git", "ls-files", "-z"],
+                ["git", "ls-files", "--others", "--exclude-standard", "-z"],
             ):
                 res = subprocess.run(
-                    args, cwd=root_path, capture_output=True, text=True, check=False
+                    args, cwd=root_path, capture_output=True, text=True, check=False, timeout=10
                 )
-                if res.returncode == 0:
-                    for line in res.stdout.splitlines():
-                        clean = line.strip()
-                        if clean and not clean.startswith(".") and accept(clean):
-                            files.add(clean)
+                if res.returncode != 0:
+                    git_ok = False
+                    break
+                for clean in res.stdout.split("\0"):
+                    if clean and not _is_hidden_path(clean) and accept(clean):
+                        files.add(clean)
 
-            if files:
+            if git_ok:
                 valid_files = [
                     f
                     for f in files
-                    if (root_path / f).is_file() and not is_binary_file(root_path / f)
+                    if (root_path / f).is_file()
+                    and not is_too_large(root_path / f)
+                    and not is_binary_file(root_path / f)
                 ]
                 valid_files.sort()
                 return valid_files
@@ -255,7 +292,7 @@ def get_repo_files(
             d
             for d in dirnames
             if d not in DEFAULT_IGNORED_DIRS
-            and not d.startswith(".")
+            and (not d.startswith(".") or (Path(dirpath) == root_path and d == ".github"))
             and (include_tests or d not in TEST_DIR_NAMES)
         ]
         rel_dir = Path(dirpath).relative_to(root_path)
@@ -266,7 +303,12 @@ def get_repo_files(
             if rel_path.startswith("./"):
                 rel_path = rel_path[2:]
             full_path = root_path / rel_path
-            if full_path.is_file() and not is_binary_file(full_path) and accept(rel_path):
+            if (
+                full_path.is_file()
+                and not is_too_large(full_path)
+                and not is_binary_file(full_path)
+                and accept(rel_path)
+            ):
                 valid_files.append(rel_path)
 
     valid_files.sort()

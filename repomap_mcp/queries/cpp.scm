@@ -5,6 +5,12 @@
 
 (class_specifier name: (type_identifier) @name) @definition.class
 
+(struct_specifier name: (type_identifier) @name body: (_)) @definition.struct
+
+(enum_specifier name: (type_identifier) @name) @definition.enum
+
+(namespace_definition name: (namespace_identifier) @name) @definition.module
+
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
 
 (class_specifier

@@ -5,13 +5,19 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import pytest
 
-from repomap_mcp.repomap import RepoMap, compute_pagerank
+from repomap_mcp.repomap import RepoMap, _extract_ts_tags, compute_pagerank
 from repomap_mcp.server import get_repo_map, get_tags, mcp
-from repomap_mcp.utils import count_tokens, find_git_root, get_git_modified_files, get_repo_files
+from repomap_mcp.utils import (
+    count_tokens,
+    find_git_root,
+    get_git_modified_files,
+    get_repo_files,
+)
 
 
 def test_token_counter():
@@ -34,21 +40,22 @@ def test_git_root_and_files():
 
 
 def test_pure_pagerank():
-    """Verify pure-Python PageRank implementation."""
-    import networkx as nx
+    """Verify pure-Python weighted PageRank implementation."""
+    nodes = ["a", "b", "c"]
+    edges = {
+        "a": {"b": 2.0},
+        "c": {"b": 1.0},
+    }
 
-    g = nx.MultiDiGraph()
-    g.add_node("a")
-    g.add_node("b")
-    g.add_node("c")
-    g.add_edge("a", "b")
-    g.add_edge("c", "b")
-
-    ranks = compute_pagerank(g)
+    ranks = compute_pagerank(nodes, edges)
     assert len(ranks) == 3
-    # 'b' has 2 in-edges, should have highest rank
+    assert abs(sum(ranks.values()) - 1.0) < 1e-6
     assert ranks["b"] > ranks["a"]
     assert ranks["b"] > ranks["c"]
+
+    # Personalization biases rank toward 'c'
+    biased = compute_pagerank(nodes, {}, personalization={"a": 1.0, "b": 1.0, "c": 20.0})
+    assert biased["c"] > biased["a"]
 
 
 def test_repomap_generation(tmp_path: Path):
@@ -111,33 +118,36 @@ def test_cache_location_inside_git(tmp_path: Path):
     git_dir.mkdir(parents=True)
 
     mapper = RepoMap(root=tmp_path)
-    expected_cache = tmp_path / ".git" / "repomap-mcp" / "cache"
+    expected_cache = (tmp_path / ".git" / "repomap-mcp" / "cache").resolve()
     assert mapper.cache_dir == expected_cache
     assert expected_cache.exists()
+    mapper.close()
 
 
 def test_cache_fallback_no_git(tmp_path: Path):
-    """Verify non-git directories fall back to ~/.cache/repomap-mcp/tags-v3-<hash>."""
+    """Verify non-git directories fall back to ~/.cache/repomap-mcp/tags-v4-<hash>."""
     import hashlib
 
-    no_git_dir = tmp_path / "plain_dir"
+    no_git_dir = (tmp_path / "plain_dir").resolve()
     no_git_dir.mkdir()
 
     mapper = RepoMap(root=no_git_dir)
     h = hashlib.sha256(str(no_git_dir).encode("utf-8")).hexdigest()[:12]
-    expected_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-v3-{h}"
+    expected_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-v4-{h}"
     assert mapper.cache_dir == expected_cache
     assert expected_cache.exists()
+    mapper.close()
 
 
 def test_cache_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Verify cache respects custom REPOMAP_CACHE_DIR and falls back properly."""
-    custom_cache = tmp_path / "custom_cache"
+    custom_cache = (tmp_path / "custom_cache").resolve()
     monkeypatch.setenv("REPOMAP_CACHE_DIR", str(custom_cache))
 
     mapper = RepoMap(root=tmp_path)
     assert mapper.cache_dir == custom_cache
     assert custom_cache.exists()
+    mapper.close()
 
 
 def test_subdirectory_scoping(tmp_path: Path):
@@ -263,6 +273,128 @@ def test_mcp_tools_registered():
     tool_names = [t.name for t in tools]
     assert "get_repo_map" in tool_names
     assert "get_tags" in tool_names
+    assert "lsp" in tool_names
+
+
+def test_extract_ts_tags_doc_and_aider_style():
+    """Verify @doc captures never mask definitions and Aider @name.definition.* works."""
+    content = b"// doc\nfunc Handle() {}\nclass User {}\nHandle()\n"
+
+    def make_node(start: int, end: int, line_idx: int):
+        return SimpleNamespace(start_byte=start, end_byte=end, start_point=(line_idx, 0))
+
+    matches = [
+        # @doc comes before @definition.function in dict iteration order
+        (
+            0,
+            {
+                "doc": [make_node(0, 6, 0)],
+                "name": [make_node(12, 18, 1)],
+                "definition.function": [make_node(7, 24, 1)],
+            },
+        ),
+        # Duplicate match for same (line, name, kind) should deduplicate
+        (
+            1,
+            {
+                "name": [make_node(12, 18, 1)],
+                "definition.function": [make_node(7, 24, 1)],
+            },
+        ),
+        # Upstream Aider capture convention
+        (2, {"name.definition.class": [make_node(30, 34, 2)]}),
+        (3, {"name.reference.call": [make_node(38, 44, 3)]}),
+    ]
+
+    tags = _extract_ts_tags(content, "a.go", "/tmp/a.go", matches)
+    assert [(t.line, t.name, t.kind, t.symbol_type) for t in tags] == [
+        (2, "Handle", "def", "func"),
+        (3, "User", "def", "class"),
+        (4, "Handle", "ref", "other"),
+    ]
+
+
+def test_line_numbers_option(tmp_path: Path):
+    """Verify line_numbers=True includes 1-indexed line numbers in repomap output."""
+    (tmp_path / "mod.py").write_text("class Alpha:\n    pass\n", encoding="utf-8")
+    out = get_repo_map(root_path=str(tmp_path), line_numbers=True)
+    assert "1│class Alpha:" in out or "1: " in out
+
+
+def test_git_ignore_no_fallthrough_and_spaces(tmp_path: Path):
+    """Verify gitignored-only repo returns [] instead of os.walk leak, and handles spaces."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+
+    (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    (tmp_path / "ignored.py").write_text("def secret(): pass\n", encoding="utf-8")
+    subprocess.run(["git", "add", ".gitignore"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True)
+
+    # With only .gitignore (hidden) and ignored.py, must NOT leak ignored.py via os.walk
+    assert get_repo_files(tmp_path) == []
+
+    # File with spaces in name should be preserved cleanly with -z
+    spaced = tmp_path / "my module.py"
+    spaced.write_text("def hello(): pass\n", encoding="utf-8")
+    assert get_repo_files(tmp_path) == ["my module.py"]
+    assert get_git_modified_files(tmp_path) == ["my module.py"]
+
+
+def test_max_file_bytes_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verify oversized files are skipped by discovery and tag extraction."""
+    import repomap_mcp.utils as utils_mod
+
+    monkeypatch.setattr(utils_mod, "MAX_FILE_BYTES", 50)
+    (tmp_path / "small.py").write_text("def ok(): pass\n", encoding="utf-8")
+    (tmp_path / "big.py").write_text("x = 1\n" * 20, encoding="utf-8")
+
+    assert get_repo_files(tmp_path) == ["small.py"]
+    assert get_tags("big.py", root_path=str(tmp_path)) == []
+
+
+def test_weighted_pagerank_focus_dependency(tmp_path: Path):
+    """Verify focus_files boosts referenced dependencies rather than starving them."""
+    (tmp_path / "caller.py").write_text(
+        "def run_workflow():\n    return process_important_order()\n", encoding="utf-8"
+    )
+    (tmp_path / "core.py").write_text(
+        "def process_important_order():\n    return 42\n", encoding="utf-8"
+    )
+    (tmp_path / "noise.py").write_text("def unused_helper():\n    return 0\n", encoding="utf-8")
+
+    mapper = RepoMap(root=tmp_path)
+    try:
+        ranks, ranked_defs, _ = mapper.build_graph(
+            ["caller.py", "core.py", "noise.py"],
+            chat_files={"caller.py"},
+            mentioned_idents=set(),
+        )
+        assert ranks["core.py"] > ranks["noise.py"]
+        assert ranked_defs.get(("core.py", "process_important_order"), 0.0) > 0.0
+    finally:
+        mapper.close()
+
+
+def test_scm_queries_compile_when_parsers_available():
+    """Compile all bundled .scm files if tree-sitter parsers are available offline."""
+    import tree_sitter as ts
+    import tree_sitter_language_pack as tslp
+
+    queries_dir = Path(__file__).resolve().parent.parent / "repomap_mcp" / "queries"
+    compiled = 0
+    for qpath in sorted(queries_dir.glob("*.scm")):
+        lang = qpath.stem
+        try:
+            ts_lang = tslp.get_language(lang)
+        except Exception:
+            continue
+        ts.Query(ts_lang, qpath.read_text(encoding="utf-8"))
+        compiled += 1
+
+    if compiled == 0:
+        pytest.skip("No tree-sitter parsers cached locally for offline .scm compilation")
 
 
 def test_stdio_jsonrpc_handshake_and_tool_call(tmp_path: Path):

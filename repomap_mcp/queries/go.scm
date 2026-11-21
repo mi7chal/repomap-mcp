@@ -29,19 +29,17 @@
     (parenthesized_expression (selector_expression field: (field_identifier) @name))
   ]) @reference.call
 
+(type_declaration
+  (type_spec
+    name: (type_identifier) @name
+    type: (interface_type))) @definition.interface
+
+(type_declaration
+  (type_spec
+    name: (type_identifier) @name
+    type: (struct_type))) @definition.struct
+
 (type_spec
   name: (type_identifier) @name) @definition.type
 
 (type_identifier) @name @reference.type
-
-(package_clause "package" (package_identifier) @name)
-
-(type_declaration (type_spec name: (type_identifier) @name type: (interface_type)))
-
-(type_declaration (type_spec name: (type_identifier) @name type: (struct_type)))
-
-(import_declaration (import_spec) @name)
-
-(var_declaration (var_spec name: (identifier) @name))
-
-(const_declaration (const_spec name: (identifier) @name))
