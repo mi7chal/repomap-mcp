@@ -1,9 +1,28 @@
+# Copyright 2026 RepoMap MCP Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Portions derived from Aider (https://github.com/Aider-AI/aider),
+# Copyright (c) Paul Gauthier, licensed under Apache License 2.0.
+
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import tiktoken
+
+MAX_FILE_BYTES = 1_000_000
 
 DEFAULT_IGNORED_DIRS = {
     ".git",
@@ -13,10 +32,12 @@ DEFAULT_IGNORED_DIRS = {
     "venv",
     "env",
     "node_modules",
+    ".pnpm-store",
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".cache",
     "dist",
     "build",
     "target",
@@ -24,7 +45,6 @@ DEFAULT_IGNORED_DIRS = {
     ".vscode",
     ".repomap-mcp",
 }
-
 BINARY_EXTENSIONS = {
     ".pyc",
     ".pyo",
@@ -34,6 +54,7 @@ BINARY_EXTENSIONS = {
     ".dll",
     ".exe",
     ".bin",
+    ".wasm",
     ".png",
     ".jpg",
     ".jpeg",
@@ -68,12 +89,26 @@ BINARY_EXTENSIONS = {
     ".eot",
     ".otf",
     ".lock",
-    ".wasm",
 }
+NON_CODE_EXTENSIONS = {
+    ".md",
+    ".txt",
+    ".rst",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".xml",
+    ".csv",
+    ".sql",
+    ".env",
+}
+TEST_DIR_NAMES = {"test", "tests", "__tests__"}
+TEST_FILE_PATTERNS = ("_test.", ".test.", "_spec.", ".spec.")
 
-MAX_FILE_BYTES = 1_000_000
-
-_tokenizer_cache = {}
+_tokenizer_cache: dict[str, tiktoken.Encoding | None] = {}
 
 
 def get_tokenizer(model: str = "gpt-4o") -> tiktoken.Encoding | None:
@@ -88,7 +123,7 @@ def get_tokenizer(model: str = "gpt-4o") -> tiktoken.Encoding | None:
     return _tokenizer_cache[model]
 
 
-def _encode_tokens(text: str, model: str = "gpt-4o") -> int:
+def _encode_tokens(text: str, model: str) -> int:
     enc = get_tokenizer(model)
     if enc is not None:
         try:
@@ -111,52 +146,34 @@ def count_tokens(text: str, model: str = "gpt-4o") -> int:
     return _encode_tokens(text, model)
 
 
-TEST_DIR_NAMES = {"test", "tests", "__tests__"}
-TEST_FILE_PATTERNS = ("_test.", ".test.", "_spec.", ".spec.")
-
-
 def is_test_path(path_str: str) -> bool:
-    norm = path_str.replace("\\", "/").lower()
-    parts = norm.split("/")
+    parts = path_str.replace("\\", "/").lower().split("/")
     if any(p in TEST_DIR_NAMES for p in parts[:-1]):
         return True
     fname = parts[-1]
-    if fname.startswith("test_") or fname.startswith("spec_"):
-        return True
-    return any(pat in fname for pat in TEST_FILE_PATTERNS)
+    return fname.startswith(("test_", "spec_")) or any(pat in fname for pat in TEST_FILE_PATTERNS)
 
 
 def find_git_root(start_path: str | Path | None = None) -> Path:
-    if start_path is None or str(start_path).strip() in ("", "."):
-        p = Path.cwd().resolve()
-    else:
-        p = Path(start_path).expanduser().resolve()
-
+    raw = "" if start_path is None else str(start_path).strip()
+    p = Path.cwd().resolve() if raw in ("", ".") else Path(raw).expanduser().resolve()
     if p.is_file():
         p = p.parent
-
-    current = p
+    cur = p
     while True:
-        if (current / ".git").exists():
-            return current
-        if current.parent == current:
-            break
-        current = current.parent
-
-    return p
+        if (cur / ".git").exists():
+            return cur
+        if cur.parent == cur:
+            return p
+        cur = cur.parent
 
 
 def resolve_scope(start_path: str | Path | None = None) -> tuple[Path, Path]:
-    if start_path is None or str(start_path).strip() in ("", "."):
-        target_dir = Path.cwd().resolve()
-    else:
-        target_dir = Path(start_path).expanduser().resolve()
-
-    if target_dir.is_file():
-        target_dir = target_dir.parent
-
-    git_root = find_git_root(target_dir)
-    return git_root, target_dir
+    raw = "" if start_path is None else str(start_path).strip()
+    target = Path.cwd().resolve() if raw in ("", ".") else Path(raw).expanduser().resolve()
+    if target.is_file():
+        target = target.parent
+    return find_git_root(target), target
 
 
 def is_too_large(path: Path) -> bool:
@@ -176,11 +193,20 @@ def is_binary_file(path: Path) -> bool:
         return True
 
 
+def _is_code_file(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() not in NON_CODE_EXTENSIONS
+        and not is_too_large(path)
+        and not is_binary_file(path)
+    )
+
+
 def _is_hidden_path(rel_path: str) -> bool:
-    for idx, part in enumerate(rel_path.split("/")):
-        if part.startswith(".") and not (idx == 0 and part == ".github"):
-            return True
-    return False
+    return any(
+        part.startswith(".") and not (idx == 0 and part == ".github")
+        for idx, part in enumerate(rel_path.split("/"))
+    )
 
 
 def get_git_modified_files(root_path: Path) -> list[str]:
@@ -190,7 +216,7 @@ def get_git_modified_files(root_path: Path) -> list[str]:
     if not (git_root / ".git").exists():
         return []
 
-    modified_files = set()
+    modified: set[str] = set()
     try:
         res = subprocess.run(
             ["git", "status", "--porcelain", "-z", "-uall"],
@@ -208,27 +234,21 @@ def get_git_modified_files(root_path: Path) -> list[str]:
                 i += 1
                 if len(entry) < 4:
                     continue
-                status = entry[:2]
-                path_part = entry[3:]
+                status, path_part = entry[:2], entry[3:]
                 if "R" in status or "C" in status:
                     i += 1
                 if "D" in status:
                     continue
                 full_path = git_root / path_part
-                if (
-                    full_path.is_file()
-                    and not is_too_large(full_path)
-                    and not is_binary_file(full_path)
-                ):
+                if _is_code_file(full_path):
                     try:
-                        rel_path = full_path.relative_to(root_path).as_posix()
-                        modified_files.add(rel_path)
+                        modified.add(full_path.relative_to(root_path).as_posix())
                     except ValueError:
                         pass
     except Exception as e:
         print(f"Warning: git status failed: {e}", file=sys.stderr)
 
-    return sorted(modified_files)
+    return sorted(modified)
 
 
 def get_repo_files(
@@ -242,21 +262,18 @@ def get_repo_files(
     rel_prefix = ""
     if target != root_path:
         try:
-            rel_prefix = target.relative_to(root_path).as_posix()
-            if not rel_prefix.endswith("/"):
-                rel_prefix += "/"
+            rel_prefix = target.relative_to(root_path).as_posix().rstrip("/") + "/"
         except ValueError:
             rel_prefix = ""
 
     def accept(rel_path: str) -> bool:
         if rel_prefix and not rel_path.startswith(rel_prefix):
             return False
-        return not (not include_tests and is_test_path(rel_path))
-
-    files: set[str] = set()
+        return include_tests or not is_test_path(rel_path)
 
     if (root_path / ".git").exists():
         try:
+            files: set[str] = set()
             git_ok = True
             for args in (
                 ["git", "ls-files", "-z"],
@@ -271,22 +288,13 @@ def get_repo_files(
                 for clean in res.stdout.split("\0"):
                     if clean and not _is_hidden_path(clean) and accept(clean):
                         files.add(clean)
-
             if git_ok:
-                valid_files = [
-                    f
-                    for f in files
-                    if (root_path / f).is_file()
-                    and not is_too_large(root_path / f)
-                    and not is_binary_file(root_path / f)
-                ]
-                valid_files.sort()
-                return valid_files
+                return sorted(f for f in files if _is_code_file(root_path / f))
         except Exception as e:
             print(f"Warning: git command failed: {e}", file=sys.stderr)
 
     walk_root = target if target.is_dir() else root_path
-    valid_files = []
+    valid_files: list[str] = []
     for dirpath, dirnames, filenames in os.walk(walk_root):
         dirnames[:] = [
             d
@@ -299,17 +307,8 @@ def get_repo_files(
         for fname in filenames:
             if fname.startswith("."):
                 continue
-            rel_path = (rel_dir / fname).as_posix()
-            if rel_path.startswith("./"):
-                rel_path = rel_path[2:]
-            full_path = root_path / rel_path
-            if (
-                full_path.is_file()
-                and not is_too_large(full_path)
-                and not is_binary_file(full_path)
-                and accept(rel_path)
-            ):
+            rel_path = (rel_dir / fname).as_posix().removeprefix("./")
+            if accept(rel_path) and _is_code_file(root_path / rel_path):
                 valid_files.append(rel_path)
 
-    valid_files.sort()
-    return valid_files
+    return sorted(valid_files)

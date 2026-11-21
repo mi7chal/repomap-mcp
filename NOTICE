@@ -9,3 +9,8 @@ licensed under the Apache License, Version 2.0.
 Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 Copyright (c) Paul Gauthier
 ========================================================================
+
+The read-only LSP tool interface and symbol-column resolution in
+repomap_mcp/lsp.py were inspired by oh-my-pi
+(https://github.com/can1357/oh-my-pi), Copyright (c) Mario Zechner,
+Can Bölük, and Stencil Labs, Inc., licensed under the MIT License.

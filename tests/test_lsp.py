@@ -17,6 +17,7 @@ import sys
 
 pull_mode = "--pull" in sys.argv
 crash_hover = "--crash-hover" in sys.argv
+sleep_hover = "--sleep-hover" in sys.argv
 docs = {}
 config_acked = False
 
@@ -103,6 +104,9 @@ while True:
     elif method == "textDocument/hover":
         if crash_hover:
             sys.exit(1)
+        if sleep_hover:
+            import time
+            time.sleep(6)
         uri = params["textDocument"]["uri"]
         pos = params["position"]
         ver = docs.get(uri, {}).get("version", 0)
@@ -291,3 +295,27 @@ def test_mcp_lsp_tool_async_smoke(tmp_path: Path):
     out = anyio.run(lsp, "status", None, None, None, str(tmp_path))
     assert "Active LSP servers:" in out
     assert "Detected binaries:" in out
+
+
+def test_lsp_timeout_reports_clear_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verify LSP timeout produces an explicit message rather than blank TimeoutError str()."""
+    mock_script = tmp_path / "mock_lsp.py"
+    mock_script.write_text(MOCK_SERVER_CODE, encoding="utf-8")
+    monkeypatch.setenv(
+        "REPOMAP_LSP_SERVERS",
+        json.dumps({"python": [sys.executable, str(mock_script), "--sleep-hover"]}),
+    )
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='to'\n", encoding="utf-8")
+    (tmp_path / "slow.py").write_text("def slow(): pass\n", encoding="utf-8")
+
+    async def run():
+        mgr = LspManager()
+        try:
+            res = await mgr.call(
+                "hover", file="slow.py", line=1, symbol="slow", root_path=str(tmp_path), timeout=5
+            )
+            assert "timed out after 5s" in res
+        finally:
+            await mgr.close_all()
+
+    anyio.run(run)

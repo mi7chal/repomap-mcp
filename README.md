@@ -68,9 +68,9 @@ Read-only Language Server Protocol (LSP) queries with lazy startup, automatic di
 - `symbol` (string, optional): Identifier on `line` (supports `name#N`, 1-indexed).
 - `root_path` (string, default: `"."`): Repository or target directory.
 - `max_results` (int, default: `50`): Output cap (`1..200`).
-- `timeout` (int, default: `15`): Request timeout in seconds (`5..120`).
+- `timeout` (int, default: `25`): Request timeout in seconds (`5..120`).
 
-Zero-config detection (checks project `.venv/bin` and `node_modules/.bin`, then `$PATH`): Python (`basedpyright-langserver`, `pyright-langserver`, `pylsp`), TypeScript/JS (`typescript-language-server`), Rust (`rust-analyzer`), Go (`gopls`), C/C++ (`clangd`). Override via `REPOMAP_LSP_SERVERS` JSON env var (e.g. `'{"python": ["pyright-langserver", "--stdio"]}'`).
+Zero-config detection (checks project `.venv/bin` and `node_modules/.bin`, then `$PATH`): Python (`basedpyright-langserver`, `pyright-langserver`, `pylsp`), TypeScript/JS (`typescript-language-server`), Svelte (`svelteserver`), Rust (`rust-analyzer`), Go (`gopls`), C/C++ (`clangd`). Override via `REPOMAP_LSP_SERVERS` JSON env var (e.g. `'{"python": ["pyright-langserver", "--stdio"]}'`). Non-code config/doc files (`.md`, `.json`, `.yaml`, `.toml`, `.sql`, etc.) are automatically skipped during repo mapping.
 
 ## Cache
 
@@ -91,4 +91,4 @@ This project was developed with AI assistance.
 
 ## License
 
-Apache License 2.0. Derived from [Aider](https://github.com/Aider-AI/aider) by Paul Gauthier. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0. Derived from [Aider](https://github.com/Aider-AI/aider) by Paul Gauthier; LSP UX inspired by [oh-my-pi](https://github.com/can1357/oh-my-pi). See [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -6,6 +6,12 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Portions of this file are based on or derived from Aider (aider/repomap.py)
 # Copyright (c) Paul Gauthier, licensed under Apache License 2.0.
 # Modified for repomap-mcp.
@@ -39,10 +45,7 @@ from .utils import (
 CACHE_VERSION = 4
 SQLITE_ERRORS = (sqlite3.Error, OSError)
 TYPE_KINDS = ("class", "struct", "interface", "enum", "type")
-_HEADER_OVERHEAD_TOKENS = count_tokens(
-    '```json\n{\n  "total_repo_files": 9999,\n  "mapped_files": 9999,\n'
-    '  "dropped_files": 9999,\n  "budget_exhausted": false\n}\n```\n\n'
-)
+_HEADER_OVERHEAD_TOKENS = 28
 
 
 @dataclass
@@ -52,7 +55,7 @@ class Tag:
     line: int
     name: str
     kind: str  # "def" | "ref"
-    symbol_type: str = "other"  # "class", "struct", "interface", "enum", "type", "func"
+    symbol_type: str = "other"
 
 
 def compute_pagerank(
@@ -93,13 +96,12 @@ def compute_pagerank(
 
     for _ in range(max_iter):
         dangling_sum = sum(ranks[n] for n in dangling_nodes)
-        base_factor = 1.0 - damping + damping * dangling_sum
-        new_ranks: dict[str, float] = {}
-
-        for n in nodes:
-            in_sum = sum(ranks[src] * (w / out_weight[src]) for src, w in incoming[n])
-            new_ranks[n] = damping * in_sum + base_factor * p_weights[n]
-
+        base = 1.0 - damping + damping * dangling_sum
+        new_ranks = {
+            n: damping * sum(ranks[src] * (w / out_weight[src]) for src, w in incoming[n])
+            + base * p_weights[n]
+            for n in nodes
+        }
         err = sum(abs(new_ranks[n] - ranks[n]) for n in nodes)
         ranks = new_ranks
         if err < tol:
@@ -113,9 +115,7 @@ def _symbol_type_from_capture(kind_str: str) -> str:
     for sym_type in TYPE_KINDS:
         if sym_type in kind_str:
             return sym_type
-    if "method" in kind_str or "function" in kind_str:
-        return "func"
-    return "other"
+    return "func" if ("method" in kind_str or "function" in kind_str) else "other"
 
 
 def _extract_ts_tags(
@@ -133,27 +133,18 @@ def _extract_ts_tags(
         kind_str: str | None = None
 
         if name_nodes:
-            other_keys = [k for k in captures if k != "name" and k != "doc"]
-            def_keys = [k for k in other_keys if "definition" in k.lower()]
-            ref_keys = [k for k in other_keys if "reference" in k.lower()]
-            if def_keys:
-                kind_str = def_keys[0].lower()
-            elif ref_keys:
-                kind_str = ref_keys[0].lower()
+            others = [k for k in captures if k not in ("name", "doc")]
+            kind_str = next(
+                (k.lower() for k in others if "definition" in k.lower()),
+                next((k.lower() for k in others if "reference" in k.lower()), None),
+            )
         else:
-            for k in captures:
-                kl = k.lower()
-                if "name.definition" in kl:
-                    name_nodes = captures[k]
-                    kind_str = kl
+            for prefix in ("name.definition", "name.reference"):
+                key = next((k for k in captures if prefix in k.lower()), None)
+                if key:
+                    name_nodes = captures[key]
+                    kind_str = key.lower()
                     break
-            if not name_nodes:
-                for k in captures:
-                    kl = k.lower()
-                    if "name.reference" in kl:
-                        name_nodes = captures[k]
-                        kind_str = kl
-                        break
 
         if not name_nodes or not kind_str:
             continue
@@ -162,75 +153,43 @@ def _extract_ts_tags(
         if kind is None:
             continue
 
-        symbol_type = _symbol_type_from_capture(kind_str)
-        for name_node in name_nodes:
-            name = content[name_node.start_byte : name_node.end_byte].decode(
-                "utf-8", errors="replace"
-            )
+        sym_type = _symbol_type_from_capture(kind_str)
+        for node in name_nodes:
+            name = content[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
             if not name or not name.isidentifier():
                 continue
-            line = name_node.start_point[0] + 1
+            line = node.start_point[0] + 1
             key = (line, name, kind)
             if key in seen:
                 continue
             seen.add(key)
-            tags.append(
-                Tag(
-                    rel_fname=rel_fname,
-                    fname=fname,
-                    line=line,
-                    name=name,
-                    kind=kind,
-                    symbol_type=symbol_type,
-                )
-            )
+            tags.append(Tag(rel_fname, fname, line, name, kind, sym_type))
 
     return tags
 
 
 def _pygments_tags(
-    content: bytes,
-    fname: str,
-    rel_fname: str,
-    refs_only: bool = False,
+    content: bytes, fname: str, rel_fname: str, refs_only: bool = False
 ) -> list[Tag]:
     tags: list[Tag] = []
     try:
-        text_content = content.decode("utf-8", errors="replace")
-        lexer = guess_lexer_for_filename(rel_fname, text_content)
+        text = content.decode("utf-8", errors="replace")
+        lexer = guess_lexer_for_filename(rel_fname, text)
         cur_line = 1
-        for token_type, val in pygments.lex(text_content, lexer):
-            lines_in_val = val.count("\n")
-            clean_name = val.strip()
+        for token_type, val in pygments.lex(text, lexer):
+            name = val.strip()
             t_str = str(token_type)
-            if clean_name.isidentifier():
+            if name.isidentifier():
                 if not refs_only and t_str in (
                     "Token.Name.Class",
                     "Token.Name.Function",
                     "Token.Name.Function.Magic",
                 ):
-                    sym_type = "class" if t_str == "Token.Name.Class" else "func"
-                    tags.append(
-                        Tag(
-                            rel_fname=rel_fname,
-                            fname=fname,
-                            line=cur_line,
-                            name=clean_name,
-                            kind="def",
-                            symbol_type=sym_type,
-                        )
-                    )
+                    sym = "class" if t_str == "Token.Name.Class" else "func"
+                    tags.append(Tag(rel_fname, fname, cur_line, name, "def", sym))
                 elif t_str.startswith("Token.Name"):
-                    tags.append(
-                        Tag(
-                            rel_fname=rel_fname,
-                            fname=fname,
-                            line=cur_line,
-                            name=clean_name,
-                            kind="ref",
-                        )
-                    )
-            cur_line += lines_in_val
+                    tags.append(Tag(rel_fname, fname, cur_line, name, "ref"))
+            cur_line += val.count("\n")
     except Exception:
         pass
     return tags
@@ -243,10 +202,7 @@ def _normalize_rel(path_str: str, root: Path) -> str:
             return p.resolve().relative_to(root).as_posix()
         except ValueError:
             return p.as_posix()
-    clean = path_str.replace("\\", "/")
-    while clean.startswith("./"):
-        clean = clean[2:]
-    return clean
+    return path_str.replace("\\", "/").lstrip("./") or path_str
 
 
 class RepoMap:
@@ -255,69 +211,42 @@ class RepoMap:
         root: str | Path | None = None,
         target_dir: str | Path | None = None,
         max_map_tokens: int = 2048,
-        verbose: bool = False,
     ):
         self.root = Path(find_git_root(root)).resolve()
         self.target_dir = Path(target_dir).resolve() if target_dir is not None else self.root
         self.max_map_tokens = max_map_tokens
-        self.verbose = verbose
         self.cache, self.cache_dir = self._init_cache()
         self._queries_cache: dict[str, str | None] = {}
 
     def _init_cache(self) -> tuple[Cache | None, Path]:
+        def _open(path: Path) -> Cache | None:
+            try:
+                return Cache(str(path))
+            except SQLITE_ERRORS:
+                return None
+
         override = os.environ.get("REPOMAP_CACHE_DIR")
         if override:
             p = Path(override).expanduser().resolve()
             p.mkdir(parents=True, exist_ok=True)
-            return self._open_cache(p), p
+            return _open(p), p
 
         git_dir = self.root / ".git"
         if git_dir.is_dir():
             repo_cache = git_dir / "repomap-mcp" / "cache"
             try:
                 repo_cache.mkdir(parents=True, exist_ok=True)
-                test_file = repo_cache / ".perm_check"
-                test_file.touch()
-                test_file.unlink()
-                return self._open_cache(repo_cache), repo_cache
+                probe = repo_cache / ".perm_check"
+                probe.touch()
+                probe.unlink()
+                return _open(repo_cache), repo_cache
             except OSError:
                 pass
 
         h = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:12]
         user_cache = Path.home() / ".cache" / "repomap-mcp" / f"tags-v{CACHE_VERSION}-{h}"
         user_cache.mkdir(parents=True, exist_ok=True)
-        return self._open_cache(user_cache), user_cache
-
-    def _open_cache(self, path: Path) -> Cache | None:
-        try:
-            return Cache(str(path))
-        except SQLITE_ERRORS as e:
-            self.log(f"Cache init error at {path}: {e}")
-            return None
-
-    def _cache_get(self, key: str) -> Any:
-        if self.cache is None:
-            return None
-        try:
-            return self.cache.get(key)
-        except SQLITE_ERRORS:
-            return None
-
-    def _cache_set(self, key: str, value: Any) -> None:
-        if self.cache is None:
-            return
-        try:
-            self.cache[key] = value
-        except SQLITE_ERRORS:
-            pass
-
-    def _cache_clear(self) -> None:
-        if self.cache is None:
-            return
-        try:
-            self.cache.clear()
-        except SQLITE_ERRORS:
-            pass
+        return _open(user_cache), user_cache
 
     def close(self) -> None:
         if self.cache is not None:
@@ -327,10 +256,6 @@ class RepoMap:
                 pass
             self.cache = None
 
-    def log(self, *args: Any, **kwargs: Any) -> None:
-        if self.verbose:
-            print("[RepoMap]", *args, file=sys.stderr, **kwargs)
-
     def _get_query_text(self, lang: str) -> str | None:
         if lang in self._queries_cache:
             return self._queries_cache[lang]
@@ -338,15 +263,14 @@ class RepoMap:
         query_text = None
         queries_dir = Path(__file__).parent / "queries"
         for candidate in (lang, "typescript" if lang == "tsx" else None):
-            if not candidate:
-                continue
-            query_path = queries_dir / f"{candidate}.scm"
-            try:
-                if query_path.is_file():
-                    query_text = query_path.read_text(encoding="utf-8")
-                    break
-            except OSError:
-                pass
+            if candidate:
+                qpath = queries_dir / f"{candidate}.scm"
+                if qpath.is_file():
+                    try:
+                        query_text = qpath.read_text(encoding="utf-8")
+                        break
+                    except OSError:
+                        pass
 
         if not query_text:
             try:
@@ -367,11 +291,17 @@ class RepoMap:
         except OSError:
             return []
 
-        cached = self._cache_get(rel_fname)
-        if isinstance(cached, dict) and cached.get("mtime") == mtime:
-            data = cached.get("data")
-            if isinstance(data, list):
-                return data
+        if self.cache is not None:
+            try:
+                cached = self.cache.get(rel_fname)
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("mtime") == mtime
+                    and isinstance(cached.get("data"), list)
+                ):
+                    return cached["data"]
+            except SQLITE_ERRORS:
+                pass
 
         try:
             content = full_path.read_bytes()
@@ -387,32 +317,31 @@ class RepoMap:
                 parser = tslp.get_parser(lang)
                 ts_lang = tslp.get_language(lang)
                 query_str = self._get_query_text(lang)
-
                 if parser and ts_lang and query_str:
                     tree = parser.parse(content)
-                    query = ts.Query(ts_lang, query_str)
-                    cursor = ts.QueryCursor(query)
+                    cursor = ts.QueryCursor(ts.Query(ts_lang, query_str))
                     tags = _extract_ts_tags(
                         content, rel_fname, fname, cursor.matches(tree.root_node)
                     )
             except Exception as e:
                 ts_failed = True
-                if self.verbose or "DownloadError" in type(e).__name__:
+                if "DownloadError" in type(e).__name__:
                     print(
                         f"[RepoMap] Tree-sitter unavailable for {rel_fname}: {e}", file=sys.stderr
                     )
 
         saw_def = any(t.kind == "def" for t in tags)
         saw_ref = any(t.kind == "ref" for t in tags)
-
         if ts_failed or not lang:
             tags = _pygments_tags(content, fname, rel_fname, refs_only=False)
         elif saw_def and not saw_ref:
             tags.extend(_pygments_tags(content, fname, rel_fname, refs_only=True))
 
-        # Never poison DiskCache with degraded fallback when Tree-sitter failed to load a parser.
-        if not ts_failed:
-            self._cache_set(rel_fname, {"mtime": mtime, "data": tags})
+        if not ts_failed and self.cache is not None:
+            try:
+                self.cache[rel_fname] = {"mtime": mtime, "data": tags}
+            except SQLITE_ERRORS:
+                pass
 
         return tags
 
@@ -427,10 +356,8 @@ class RepoMap:
         references: dict[str, list[str]] = defaultdict(list)
 
         for rel_fname in all_files:
-            full_path = (self.root / rel_fname).as_posix()
-            tags = self.get_tags(full_path, rel_fname)
+            tags = self.get_tags((self.root / rel_fname).as_posix(), rel_fname)
             file_tags[rel_fname] = tags
-
             for tag in tags:
                 if tag.kind == "def":
                     defines[tag.name].add(rel_fname)
@@ -443,7 +370,7 @@ class RepoMap:
         edges: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         edge_items: list[tuple[str, str, str, float]] = []
 
-        for ident in set(defines.keys()) & set(references.keys()):
+        for ident in set(defines) & set(references):
             def_files = defines[ident]
             mul = 1.0
             is_camel = any(c.islower() for c in ident) and any(c.isupper() for c in ident)
@@ -472,16 +399,21 @@ class RepoMap:
                     edge_items.append((rf, df, ident, base_w))
 
         n_files = len(all_files) or 1
-        personalization: dict[str, float] = {}
-        for f in all_files:
-            w = 1.0 / n_files
-            if f in chat_files:
-                w += 10.0 / n_files
-            elif mentioned_idents and any(
-                t.kind == "def" and t.name in mentioned_idents for t in file_tags.get(f, [])
-            ):
-                w += 10.0 / n_files
-            personalization[f] = w
+        personalization = {
+            f: (1.0 / n_files)
+            + (
+                10.0 / n_files
+                if f in chat_files
+                or (
+                    mentioned_idents
+                    and any(
+                        t.kind == "def" and t.name in mentioned_idents for t in file_tags.get(f, [])
+                    )
+                )
+                else 0.0
+            )
+            for f in all_files
+        }
 
         file_ranks = compute_pagerank(all_files, edges, personalization=personalization)
         out_weights = {src: sum(dsts.values()) for src, dsts in edges.items()}
@@ -500,7 +432,6 @@ class RepoMap:
         tags: list[Tag],
         types_only: bool = False,
         lines_of_interest: list[int] | None = None,
-        margin: int | None = None,
         line_numbers: bool = False,
         _code_cache: dict[str, str] | None = None,
         _tc_cache: dict[str, Any] | None = None,
@@ -529,9 +460,6 @@ class RepoMap:
         else:
             lois = [t.line for t in tags if t.kind == "def"] or [1]
 
-        if margin is None:
-            margin = 0 if types_only else 3
-
         tc = None
         if _tc_cache is not None and rel_fname in _tc_cache:
             tc = _tc_cache[rel_fname]
@@ -544,12 +472,13 @@ class RepoMap:
                     line_number=line_numbers,
                     mark_lois=False,
                     last_line=False,
-                    margin=margin,
-                    child_context=margin > 0,
-                    loi_pad=1 if margin > 0 else 0,
+                    margin=0,
+                    child_context=False,
+                    loi_pad=0,
+                    header_max=3,
+                    show_top_of_file_parent_scope=False,
                 )
-            except Exception as e:
-                self.log(f"TreeContext error on {rel_fname}: {e}")
+            except Exception:
                 tc = None
             if _tc_cache is not None:
                 _tc_cache[rel_fname] = tc
@@ -558,13 +487,8 @@ class RepoMap:
             tc.lines_of_interest.clear()
             tc.show_lines.clear()
             tc.output_lines.clear()
-            tc.margin = margin
-            tc.child_context = margin > 0
-            tc.loi_pad = 1 if margin > 0 else 0
             tc.line_number = line_numbers
-
-            tc_lois = {max(0, line_no - 1) for line_no in lois}
-            tc.add_lines_of_interest(tc_lois)
+            tc.add_lines_of_interest({max(0, line_no - 1) for line_no in lois})
             tc.add_context()
             formatted = tc.format()
             if formatted:
@@ -577,16 +501,10 @@ class RepoMap:
                 for idx in sorted(set(lois))
                 if 1 <= idx <= len(lines)
             ]
-            if not selected:
-                return None
-            return f"{rel_fname}:\n" + "\n".join(selected) + "\n"
+            return (f"{rel_fname}:\n" + "\n".join(selected) + "\n") if selected else None
 
-        preview_lines = lines[:10]
-        if line_numbers:
-            preview = "\n".join(f"{i + 1: 3}│{line}" for i, line in enumerate(preview_lines))
-        else:
-            preview = "\n".join(preview_lines)
-        return f"{rel_fname}:\n{preview}\n...\n"
+        preview = [f"{i + 1: 3}│{ln}" if line_numbers else ln for i, ln in enumerate(lines[:10])]
+        return f"{rel_fname}:\n" + "\n".join(preview) + "\n...\n"
 
     def get_repo_map(
         self,
@@ -600,8 +518,11 @@ class RepoMap:
         auto_focus_git: bool = True,
         line_numbers: bool = False,
     ) -> str:
-        if force_refresh:
-            self._cache_clear()
+        if force_refresh and self.cache is not None:
+            try:
+                self.cache.clear()
+            except SQLITE_ERRORS:
+                pass
 
         max_tokens = max_map_tokens if max_map_tokens is not None else self.max_map_tokens
         if max_tokens <= 0:
@@ -609,39 +530,33 @@ class RepoMap:
 
         body_budget = max(1, max_tokens - _HEADER_OVERHEAD_TOKENS)
 
-        if other_files is not None:
-            all_files = [_normalize_rel(f, self.root) for f in other_files]
-        else:
-            all_files = get_repo_files(
-                self.root,
-                target_dir=self.target_dir,
-                include_tests=include_tests,
-            )
-
+        all_files = (
+            [_normalize_rel(f, self.root) for f in other_files]
+            if other_files is not None
+            else get_repo_files(self.root, target_dir=self.target_dir, include_tests=include_tests)
+        )
         if not all_files:
             return "No files found in repository."
 
         chat_set = {_normalize_rel(f, self.root) for f in (focus_files or [])}
         if auto_focus_git:
-            git_modified = get_git_modified_files(self.root)
-            all_files_set = set(all_files)
-            for gm in git_modified:
-                if gm in all_files_set or other_files is None:
+            all_set = set(all_files)
+            for gm in get_git_modified_files(self.root):
+                if gm in all_set or other_files is None:
                     chat_set.add(gm)
 
         ident_set = set(mentioned_idents or [])
-
         file_ranks, ranked_definitions, file_tags = self.build_graph(all_files, chat_set, ident_set)
         ranked_files = sorted(all_files, key=lambda f: file_ranks.get(f, 0.0), reverse=True)
 
-        candidate_tags_by_file: dict[str, list[Tag]] = {}
-        for f in ranked_files:
-            tags = file_tags.get(f, [])
-            if types_only:
-                c_tags = [t for t in tags if t.kind == "def" and t.symbol_type in TYPE_KINDS]
-            else:
-                c_tags = [t for t in tags if t.kind == "def"]
-            candidate_tags_by_file[f] = c_tags
+        candidate_tags_by_file = {
+            f: [
+                t
+                for t in file_tags.get(f, [])
+                if t.kind == "def" and (not types_only or t.symbol_type in TYPE_KINDS)
+            ]
+            for f in ranked_files
+        }
 
         def get_tag_priority(t: Tag) -> float:
             rank = (
@@ -650,15 +565,10 @@ class RepoMap:
             )
             if ident_set and t.name in ident_set:
                 rank *= 2.0
-            if t.symbol_type in TYPE_KINDS:
-                multiplier = 3.0
-            elif t.symbol_type == "func":
-                multiplier = 1.5
-            else:
-                multiplier = 1.0
-            return rank * multiplier
+            mul = 3.0 if t.symbol_type in TYPE_KINDS else (1.5 if t.symbol_type == "func" else 1.0)
+            return rank * mul
 
-        all_ranked_tags = [t for f in ranked_files for t in candidate_tags_by_file.get(f, [])]
+        all_ranked_tags = [t for f in ranked_files for t in candidate_tags_by_file[f]]
         all_ranked_tags.sort(key=get_tag_priority, reverse=True)
 
         files_to_map = (
@@ -671,21 +581,15 @@ class RepoMap:
         tc_cache: dict[str, Any] = {}
 
         def _render_within_budget(
-            files_list: list[str],
-            margin: int,
-            lois_map: dict[str, list[int]] | None = None,
+            files_list: list[str], lois_map: dict[str, list[int]] | None = None
         ) -> tuple[str, list[str], bool]:
-            chunks: list[str] = []
-            used_files: list[str] = []
-            running_tokens = 0
+            chunks, used_files, running_tokens = [], [], 0
             for f in files_list:
-                lois = lois_map[f] if lois_map is not None else None
                 r = self.render_tree(
                     f,
                     candidate_tags_by_file[f],
                     types_only=types_only,
-                    lines_of_interest=lois,
-                    margin=margin,
+                    lines_of_interest=lois_map[f] if lois_map is not None else None,
                     line_numbers=line_numbers,
                     _code_cache=code_cache,
                     _tc_cache=tc_cache,
@@ -698,52 +602,32 @@ class RepoMap:
                 if running_tokens > body_budget:
                     return "\n".join(chunks), used_files, True
             output = "\n".join(chunks).strip()
-            exceeded = bool(output) and count_tokens(output) > body_budget
-            return output, used_files, exceeded
+            return output, used_files, bool(output) and count_tokens(output) > body_budget
 
-        mapped_files: list[str] = []
-        best_output = ""
+        best_output, mapped_files, exceeded = _render_within_budget(files_to_map)
         pruned_or_truncated = False
 
-        # Tier 1: Full context (margin=3, or 0 for types_only)
-        tier1_margin = 0 if types_only else 3
-        t1_out, t1_files, t1_exceeded = _render_within_budget(files_to_map, tier1_margin)
-        if not t1_exceeded and t1_out:
-            best_output = t1_out
-            mapped_files = t1_files
-        else:
-            # Tier 2: Compact context (margin=0) if not already tried in Tier 1
-            if not types_only:
-                t2_out, t2_files, t2_exceeded = _render_within_budget(files_to_map, 0)
-                if not t2_exceeded and t2_out:
-                    best_output = t2_out
-                    mapped_files = t2_files
-
-            # Tier 3: Hierarchical symbol pruning via binary search over ranked tags
-            if not best_output and all_ranked_tags:
+        if exceeded or not best_output:
+            best_output, mapped_files = "", []
+            if all_ranked_tags:
                 pruned_or_truncated = True
-                low = 1
-                high = len(all_ranked_tags)
-
+                low, high = 1, len(all_ranked_tags)
                 while low <= high:
                     mid = (low + high) // 2
                     lois_by_file: dict[str, list[int]] = defaultdict(list)
                     for t in all_ranked_tags[:mid]:
                         lois_by_file[t.rel_fname].append(t.line)
-
                     cand_files = [f for f in files_to_map if f in lois_by_file]
-                    cand_out, used, exceeded = _render_within_budget(
-                        cand_files, 0, lois_map=lois_by_file
+                    cand_out, used, cand_exceeded = _render_within_budget(
+                        cand_files, lois_map=lois_by_file
                     )
-                    if not exceeded and cand_out:
-                        best_output = cand_out
-                        mapped_files = used
+                    if not cand_exceeded and cand_out:
+                        best_output, mapped_files = cand_out, used
                         pruned_or_truncated = mid < len(all_ranked_tags)
                         low = mid + 1
                     else:
                         high = mid - 1
 
-            # Tier 4: Fallback for extremely constrained token budgets
             if not best_output:
                 pruned_or_truncated = True
                 first = files_to_map[0]
@@ -752,21 +636,19 @@ class RepoMap:
                         first,
                         candidate_tags_by_file[first],
                         types_only=types_only,
-                        margin=0,
                         line_numbers=line_numbers,
                         _code_cache=code_cache,
                         _tc_cache=tc_cache,
                     )
                     or ""
                 )
-                truncated: list[str] = []
+                kept: list[str] = []
                 for line in first_render.splitlines():
-                    truncated.append(line)
-                    if count_tokens("\n".join(truncated)) > body_budget:
-                        truncated.pop()
+                    kept.append(line)
+                    if count_tokens("\n".join(kept)) > body_budget:
+                        kept.pop()
                         break
-                best_output = "\n".join(truncated)
-                mapped_files = [first]
+                best_output, mapped_files = "\n".join(kept), [first]
 
         telemetry = {
             "total_repo_files": len(all_files),
@@ -774,5 +656,5 @@ class RepoMap:
             "dropped_files": len(all_files) - len(mapped_files),
             "budget_exhausted": (len(mapped_files) < len(all_files)) or pruned_or_truncated,
         }
-        header = f"```json\n{json.dumps(telemetry, indent=2)}\n```\n\n"
+        header = f"```json\n{json.dumps(telemetry)}\n```\n\n"
         return header + best_output.strip()

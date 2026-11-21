@@ -81,17 +81,18 @@ async def _lifespan(_server: Any):
 mcp = FastMCP(
     "repomap",
     instructions=(
-        "Provides token-budgeted, AST-based repository maps with PageRank importance "
-        "ranking plus read-only LSP semantic navigation. Use get_repo_map (optionally with "
-        "line_numbers=True) to orient across files, and lsp for exact definitions, references, "
-        "hover types, and diagnostics."
+        "Token-budgeted Tree-sitter + PageRank repo map and read-only LSP tools. "
+        "Use get_repo_map (with line_numbers=True) to orient, then lsp for exact "
+        "definitions, references, hover types, and diagnostics."
     ),
     lifespan=_lifespan,
 )
 
-_TOOL_KW: dict[str, Any] = {}
-if ToolAnnotations is not None and "annotations" in inspect.signature(mcp.tool).parameters:
-    _TOOL_KW["annotations"] = ToolAnnotations(readOnlyHint=True)
+_TOOL_KW: dict[str, Any] = (
+    {"annotations": ToolAnnotations(readOnlyHint=True)}
+    if ToolAnnotations is not None and "annotations" in inspect.signature(mcp.tool).parameters
+    else {}
+)
 
 
 @mcp.tool(**_TOOL_KW)
@@ -107,28 +108,11 @@ def get_repo_map(
     auto_focus_git: bool = True,
     line_numbers: bool = False,
 ) -> str:
-    """Generate an Aider-style token-budgeted repository map with PageRank ranking.
-
-    Args:
-        root_path: Target directory (scopes candidate files; '.' maps entire repo).
-        include_tests: Include unit tests and test directories. Defaults to False.
-        types_only: Include only type definitions (structs, classes, interfaces, enums).
-        focus_files: Files currently active in editor to bias PageRank towards.
-        other_files: Explicit list of files to map. Defaults to discovered files.
-        mentioned_idents: Identifiers mentioned in current prompt to prioritize.
-        max_map_tokens: Token budget for the output map.
-        force_refresh: Force re-parsing of AST tags.
-        auto_focus_git: Automatically bias ranking towards git modified/untracked files.
-        line_numbers: Prefix mapped source lines with 1-indexed line numbers for lsp handoff.
-    Returns:
-        Concise code skeleton highlighting key definitions and call signatures.
-    """
+    """Generate a token-budgeted repository map with PageRank importance ranking."""
     git_root, target_dir = resolve_scope(root_path)
     if not target_dir.is_dir():
         return f"Error: Directory not found: {root_path}"
-
-    mapper = _get_mapper(git_root, target_dir, max_map_tokens=max_map_tokens)
-    return mapper.get_repo_map(
+    return _get_mapper(git_root, target_dir, max_map_tokens=max_map_tokens).get_repo_map(
         focus_files=focus_files,
         other_files=other_files,
         mentioned_idents=mentioned_idents,
@@ -143,20 +127,10 @@ def get_repo_map(
 
 @mcp.tool(**_TOOL_KW)
 def get_tags(file_path: str, root_path: str = ".") -> list[dict[str, Any]]:
-    """Extract code definitions and references for a specific file via Tree-sitter.
-
-    Args:
-        file_path: Path to the target source file.
-        root_path: Repository root or target directory.
-
-    Returns:
-        List of extracted tags with line numbers, symbol names, kind, and symbol_type.
-    """
+    """Extract Tree-sitter definitions and references for a single file."""
     git_root, target_dir = resolve_scope(root_path)
     if not target_dir.is_dir():
         return []
-
-    mapper = _get_mapper(git_root, target_dir)
     raw_path = Path(file_path)
     if raw_path.is_absolute():
         full_path = raw_path.resolve()
@@ -164,14 +138,11 @@ def get_tags(file_path: str, root_path: str = ".") -> list[dict[str, Any]]:
         full_path = (target_dir / file_path).resolve()
         if not full_path.exists():
             full_path = (git_root / file_path).resolve()
-
     rel_path = (
         full_path.relative_to(git_root).as_posix()
         if full_path.is_relative_to(git_root)
         else file_path
     )
-
-    tags = mapper.get_tags(str(full_path), rel_path)
     return [
         {
             "rel_fname": t.rel_fname,
@@ -180,7 +151,7 @@ def get_tags(file_path: str, root_path: str = ".") -> list[dict[str, Any]]:
             "kind": t.kind,
             "symbol_type": t.symbol_type,
         }
-        for t in tags
+        for t in _get_mapper(git_root, target_dir).get_tags(str(full_path), rel_path)
     ]
 
 
@@ -192,21 +163,9 @@ async def lsp(
     symbol: str | None = None,
     root_path: str = ".",
     max_results: int = 50,
-    timeout: int = 15,
+    timeout: int = 25,
 ) -> str:
-    """Query a local language server (read-only) for exact semantic code intelligence.
-
-    Args:
-        action: One of definition, references, hover, diagnostics, or status.
-        file: Source file path (required except for action='status').
-        line: 1-indexed line number (required for definition, references, hover).
-        symbol: Identifier on `line` (supports `name#N` 1-indexed occurrence).
-        root_path: Repository or target directory scope.
-        max_results: Cap on returned locations/diagnostics (1..200).
-        timeout: Per-call timeout in seconds (5..120).
-    Returns:
-        Compact plain-text LSP results with relative paths and 1-indexed line:col locations.
-    """
+    """Read-only LSP query: definition, references, hover, diagnostics, or status."""
     return await _lsp_manager.call(
         action=action,
         file=file,
@@ -222,7 +181,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Local stdio MCP server for repository mapping")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.parse_args()
-
     mcp.run(transport="stdio")
 
 

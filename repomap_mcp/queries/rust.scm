@@ -14,8 +14,14 @@
     name: (type_identifier) @name) @definition.struct
 
 
-(type_item
-    name: (type_identifier) @name) @definition.type
+(source_file
+    (type_item
+        name: (type_identifier) @name) @definition.type)
+
+(mod_item
+    body: (declaration_list
+        (type_item
+            name: (type_identifier) @name) @definition.type))
 
 
 (declaration_list

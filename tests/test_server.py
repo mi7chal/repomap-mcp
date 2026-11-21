@@ -354,6 +354,15 @@ def test_max_file_bytes_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert get_tags("big.py", root_path=str(tmp_path)) == []
 
 
+def test_non_code_extensions_skipped(tmp_path: Path):
+    """Verify docs/config/data files are skipped by repo discovery."""
+    (tmp_path / "main.py").write_text("def run(): pass\n", encoding="utf-8")
+    for name in ("README.md", "config.yaml", "Cargo.toml", "schema.sql", "data.json"):
+        (tmp_path / name).write_text("x\n", encoding="utf-8")
+
+    assert get_repo_files(tmp_path) == ["main.py"]
+
+
 def test_weighted_pagerank_focus_dependency(tmp_path: Path):
     """Verify focus_files boosts referenced dependencies rather than starving them."""
     (tmp_path / "caller.py").write_text(

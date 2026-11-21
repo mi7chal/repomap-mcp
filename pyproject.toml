@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Local stdio Model Context Protocol (MCP) server for repository mapping"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 authors = [
     { name = "RepoMap MCP Contributors" }
